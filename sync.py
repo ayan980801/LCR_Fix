@@ -1,5 +1,3 @@
-"""Utilities to sync PostgreSQL tables to Azure Delta storage."""
-
 from azure.storage.blob import BlobServiceClient
 from pyspark.sql import SparkSession
 from psycopg2 import pool, OperationalError, sql
@@ -112,16 +110,15 @@ class PostgresDataHandler:
 
     def export_table_to_delta(self, table: str, stage: str, db: str, fetchsize: int = 10000) -> None:
         """
-        Export a table directly from PostgreSQL to Delta Lake using JDBC
-        This bypasses CSV completely and avoids all the row count issues
+        Export a table directly from PostgreSQL to Delta Lake using JDBC.
+        This bypasses CSV completely and avoids all the row count issues.
+        Row counts are NOT computed due to performance considerations.
         """
         try:
             if not self._is_valid_table_name(table):
                 raise ValueError(f"Invalid table name: {table}")
 
-            # Get actual row count from PostgreSQL for verification
-            pg_count = self.get_table_count(table)
-            logging.info(f"Starting direct JDBC export of {pg_count} rows from {table}")
+            logging.info(f"Starting direct JDBC export for {table}")
 
             # Create JDBC URL and properties
             jdbc_url = f"jdbc:postgresql://{self.pg_config['host']}:{self.pg_config['port']}/{self.pg_config['database']}"
@@ -138,21 +135,13 @@ class PostgresDataHandler:
             schema, tbl = self._parse_table_name(table)
 
             # Use Spark's JDBC reader to load directly from PostgreSQL
-            # This completely avoids any CSV intermediate step
             df = spark.read.jdbc(url=jdbc_url, table=f"{schema}.{tbl}", properties=properties)
-            
+
             # Log the schema to verify correct data types
             logging.info(f"JDBC schema for {table}:")
             for field in df.schema.fields:
                 logging.info(f"  {field.name}: {field.dataType}")
-            
-            # Count rows to verify
-            jdbc_count = df.count()
-            logging.info(f"JDBC read {jdbc_count} rows from {table}")
-            
-            if jdbc_count != pg_count:
-                logging.warning(f"Row count mismatch: PostgreSQL={pg_count}, JDBC={jdbc_count}")
-            
+
             # Add metadata columns
             df = df.withColumns(
                 {
@@ -163,26 +152,19 @@ class PostgresDataHandler:
                     "EDW_EXTERNAL_SOURCE_SYSTEM": lit("LeadCustodyRepository"),
                 }
             )
-            
+
             # Calculate Delta Lake path
             clean_table = tbl
             flp = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}/{clean_table}"
-            
+
             # Write to Delta Lake
             df.write.format("delta").mode("overwrite").option(
                 "overwriteSchema", "true"
             ).save(flp)
-            
-            # Verify Delta file row count
-            delta_df = spark.read.format("delta").load(flp)
-            delta_count = delta_df.count()
-            logging.info(f"Delta file count for {table}: {delta_count}")
-            
-            if delta_count != jdbc_count:
-                logging.warning(f"Delta count ({delta_count}) doesn't match JDBC count ({jdbc_count})")
-            else:
-                logging.info(f"Successfully exported {delta_count} rows from {table} to Delta")
-                
+
+            # Instead, log export completion
+            logging.info(f"Successfully exported table {table} to Delta (row counts skipped for performance).")
+
         except Exception as e:
             logging.error(f"Failed to export table '{table}': {str(e)}")
             logging.error(traceback.format_exc())
@@ -230,7 +212,7 @@ class PostgresAzureDataSync:
         if not self.postgres_handler.is_connection_alive():
             logging.error("PostgreSQL connection is not alive. Aborting operation.")
             return
-        
+
         for table in tables_to_copy:
             try:
                 logging.info(f"Processing table {table}")
