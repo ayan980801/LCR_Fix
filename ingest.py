@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 import logging
 import pytz
 import dateutil.parser
@@ -41,7 +41,7 @@ except Exception:  # pragma: no cover
 
     dbutils = _DummyDBUtils()
     logger.warning("DBUtils not available; using environment variables for secrets")
-
+ 
 # Constants
 TIMEZONE = "America/New_York"
 RAW_BASE_PATH = "abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/RAW/LeadCustodyRepository"
@@ -49,10 +49,10 @@ METADATA_BASE_PATH = "dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR
 
 # Define Snowflake connection configuration for the staging schema
 sf_config_stg: Dict[str, str] = {
-    "sfURL": "",
+    "sfURL": "hmkovlx-nu26765.snowflakecomputing.com",
     "sfDatabase": "DEV",
     "sfWarehouse": "INTEGRATION_COMPUTE_WH",
-    "sfRole": "ACCOUNTADMIN",
+    "sfRole": "SG-SNOWFLAKE-DEVELOPERS",
     "sfSchema": "QUILITY_EDW_STAGE",
     "sfUser": dbutils.secrets.get(
         scope="key-vault-secret", key="DataProduct-SF-EDW-User"
@@ -533,7 +533,8 @@ def snowflake_table_exists(table_name: str) -> bool:
     )
     try:
         df = spark.read.format("net.snowflake.spark.snowflake").options(**sf_config_stg).option("query", query).load()
-        return df.count() > 0
+        # Efficient table existence check: only fetch up to 1 row
+        return len(df.take(1)) > 0
     except Exception as e:
         logger.error(f"Failed to check table existence: {e}")
         return False
@@ -765,25 +766,18 @@ def process_table(
     try:
         # 1) Load raw data
         raw_df = load_raw_data(table_name)
-        source_count = raw_df.count()
-        logger.info(f"Loaded {source_count} raw records from source for table {table_name}")
+        logger.info(f"Loaded raw records from source for table {table_name} (row count skipped for performance).")
         
         # 2) Rename columns and add missing ones
         raw_df = rename_and_add_columns(raw_df, table_name)
         validate_dataframe(raw_df, table_schemas[table_name], check_types=False)
-        after_rename_count = raw_df.count()
-        if after_rename_count != source_count:
-            logger.warning(f"Row count changed after column renaming: {source_count} -> {after_rename_count}")
+        logger.info(f"Renamed columns for table {table_name} (row count skipped for performance).")
         
         # 3) Transform columns
         target_schema = table_schemas[table_name]
         raw_df = transform_columns(raw_df, target_schema, table_name)
         validate_dataframe(raw_df, target_schema)
-        after_transform_count = raw_df.count()
-        logger.info(f"Data transformation completed for table {table_name}")
-        
-        if after_transform_count != after_rename_count:
-            logger.warning(f"Row count changed after transformation: {after_rename_count} -> {after_transform_count}")
+        logger.info(f"Data transformation completed for table {table_name} (row count skipped for performance).")
 
         # 4) Special handling for lead_assignment
         if table_name == "lead_assignment":
@@ -832,7 +826,7 @@ def process_table(
                 ).otherwise(col(ts_col))
             )
 
-        final_count = raw_df.count()
+        logger.info(f"DataFrame finalization completed for table {table_name} (row count skipped for performance).")
 
         # 9) Write to Snowflake
         if not snowflake_table_exists(f"STG_LCR_{table_name.upper()}"):
@@ -848,7 +842,6 @@ def process_table(
                     "truncate_table": "on"
                 }
                 dummy_df = spark.createDataFrame([], target_schema)
-                # Using the Snowflake connector format "net.snowflake.spark.snowflake"
                 dummy_df.write.format("net.snowflake.spark.snowflake").options(**truncate_options).mode("overwrite").save()
                 logger.info(f"Table STG_LCR_{table_name.upper()} truncated successfully")
 
@@ -867,20 +860,16 @@ def process_table(
                         raise
                     logger.warning(f"Snowflake write failed, retrying... {w_err}")
                     time.sleep(5)
-            logger.info(f"Successfully wrote {final_count} rows to Snowflake for table {table_name}")
+            logger.info(f"Successfully wrote to Snowflake for table {table_name} (row count skipped for performance).")
             create_checkpoint(table_name)
 
         elif write_mode == "incremental_insert":
             last_runtime = get_last_runtime(table_name)
             raw_df = raw_df.withColumn("MODIFY_DATE", coalesce(col("MODIFY_DATE"), col("CREATE_DATE")))
+            # NOTE: We no longer check if DataFrame is empty due to performance. Snowflake will ignore empty writes.
             raw_df_filtered = raw_df if historical_load else raw_df.filter(col("MODIFY_DATE") >= last_runtime)
 
-            if raw_df_filtered.rdd.isEmpty():
-                logger.info(f"No new records to process for table {table_name}")
-                return
-
             validate_dataframe(raw_df_filtered, target_schema)
-            record_count = raw_df_filtered.count()
             write_options = {
                 **sf_config_stg,
                 "dbtable": f"STG_LCR_{table_name.upper()}",
@@ -898,7 +887,7 @@ def process_table(
                     logger.warning(f"Snowflake write failed, retrying... {w_err}")
                     time.sleep(5)
             update_last_runtime(table_name, datetime.now(pytz.timezone(TIMEZONE)))
-            logger.info(f"Appended {record_count} new records to table STG_LCR_{table_name.upper()}")
+            logger.info(f"Appended records to table STG_LCR_{table_name.upper()} (row count skipped for performance).")
             create_checkpoint(table_name)
 
         else:
