@@ -1,6 +1,8 @@
+"""Utilities to sync PostgreSQL tables to Azure Delta storage."""
+
 from azure.storage.blob import BlobServiceClient
 from pyspark.sql import SparkSession
-from psycopg2 import extras, pool, OperationalError
+from psycopg2 import pool, OperationalError, sql
 from typing import Dict, Optional
 import concurrent.futures
 import logging
@@ -8,7 +10,34 @@ import os
 import psycopg2
 import re
 import traceback
+import time
 from pyspark.sql.functions import current_timestamp, lit
+
+try:
+    from pyspark.dbutils import DBUtils
+    dbutils = DBUtils(SparkSession.builder.getOrCreate())
+except Exception:  # pragma: no cover - running outside Databricks
+    class _DummySecrets:
+        def get(self, scope: str, key: str) -> str:
+            env_key = f"{scope}_{key}".upper()
+            value = os.getenv(env_key)
+            if value is None:
+                raise ValueError(f"Missing secret for {env_key}")
+            return value
+
+    class _DummyFS:
+        def ls(self, path: str):
+            raise NotImplementedError("dbutils.fs.ls not implemented outside Databricks")
+
+        def mkdirs(self, path: str):
+            logging.info(f"[DRY-RUN] Would create directory: {path}")
+
+    class _DummyDBUtils:
+        secrets = _DummySecrets()
+        fs = _DummyFS()
+
+    dbutils = _DummyDBUtils()
+    logging.warning("DBUtils not available; using environment variables for secrets")
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -20,18 +49,23 @@ spark = SparkSession.builder.getOrCreate()
 
 # Postgres Handler
 class PostgresDataHandler:
-    def __init__(self, pg_pool):
+    """Handle PostgreSQL interactions using a connection pool."""
+
+    def __init__(self, pg_pool: pool.ThreadedConnectionPool, pg_config: Dict[str, str]):
         self.pg_pool = pg_pool
+        self.pg_config = pg_config
 
     @staticmethod
-    def connect_to_postgres(pg_config: dict) -> psycopg2.extensions.connection:
+    def connect_to_postgres(pg_config: Dict[str, str]) -> pool.ThreadedConnectionPool:
+        """Create a connection pool to PostgreSQL."""
         try:
-            return psycopg2.pool.ThreadedConnectionPool(1, 500, **pg_config)
+            return psycopg2.pool.ThreadedConnectionPool(1, 20, **pg_config)
         except OperationalError as e:
             logging.error(f"Failed to connect to PostgreSQL: {str(e)}")
             raise
 
     def is_connection_alive(self):
+        """Check if a connection from the pool is alive."""
         conn = self.pg_pool.getconn()
         try:
             with conn.cursor() as cursor:
@@ -42,44 +76,70 @@ class PostgresDataHandler:
         finally:
             self.pg_pool.putconn(conn)
 
+    @staticmethod
+    def _is_valid_table_name(table: str) -> bool:
+        """Validate table name to contain only allowed characters."""
+        return bool(re.fullmatch(r"[\w\.\"]+", table))
+
+    @staticmethod
+    def _parse_table_name(table: str) -> (str, str):
+        """Split schema.table into components and remove quotes."""
+        clean = table.replace('"', '')
+        if '.' in clean:
+            schema, tbl = clean.split('.', 1)
+        else:
+            schema, tbl = 'public', clean
+        return schema, tbl
+
     def get_table_count(self, table: str) -> int:
-        """Get actual row count from PostgreSQL table"""
+        """Get actual row count from a PostgreSQL table in a safe manner."""
+        if not self._is_valid_table_name(table):
+            raise ValueError(f"Invalid table name: {table}")
+
+        schema, tbl = self._parse_table_name(table)
         conn = self.pg_pool.getconn()
         try:
             with conn.cursor() as cursor:
-                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                    sql.Identifier(schema), sql.Identifier(tbl)
+                )
+                cursor.execute(query)
                 count = cursor.fetchone()[0]
                 logging.info(f"PostgreSQL count for {table}: {count}")
                 return count
         finally:
             self.pg_pool.putconn(conn)
 
-    def export_table_to_delta(self, table: str, stage: str, db: str) -> None:
+    def export_table_to_delta(self, table: str, stage: str, db: str, fetchsize: int = 10000) -> None:
         """
         Export a table directly from PostgreSQL to Delta Lake using JDBC
         This bypasses CSV completely and avoids all the row count issues
         """
         try:
+            if not self._is_valid_table_name(table):
+                raise ValueError(f"Invalid table name: {table}")
+
             # Get actual row count from PostgreSQL for verification
             pg_count = self.get_table_count(table)
             logging.info(f"Starting direct JDBC export of {pg_count} rows from {table}")
-            
+
             # Create JDBC URL and properties
-            jdbc_url = f"jdbc:postgresql://{pg_config['host']}:{pg_config['port']}/{pg_config['database']}"
+            jdbc_url = f"jdbc:postgresql://{self.pg_config['host']}:{self.pg_config['port']}/{self.pg_config['database']}"
             properties = {
-                "user": pg_config['user'],
-                "password": pg_config['password'],
+                "user": self.pg_config['user'],
+                "password": self.pg_config['password'],
                 "driver": "org.postgresql.Driver",
                 # Increase fetch size for better performance
-                "fetchsize": "10000"
+                "fetchsize": str(fetchsize),
             }
-            
+
             # Table name without quotes for JDBC
             table_name = table.replace('"', '')
-            
+            schema, tbl = self._parse_table_name(table)
+
             # Use Spark's JDBC reader to load directly from PostgreSQL
             # This completely avoids any CSV intermediate step
-            df = spark.read.jdbc(url=jdbc_url, table=table, properties=properties)
+            df = spark.read.jdbc(url=jdbc_url, table=f"{schema}.{tbl}", properties=properties)
             
             # Log the schema to verify correct data types
             logging.info(f"JDBC schema for {table}:")
@@ -105,7 +165,7 @@ class PostgresDataHandler:
             )
             
             # Calculate Delta Lake path
-            clean_table = table.replace('public."', '').replace('"', '')
+            clean_table = tbl
             flp = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}/{clean_table}"
             
             # Write to Delta Lake
@@ -144,11 +204,14 @@ class AzureDataHandler:
             raise
 
     def ensure_directory_exists(self, stage: str, db: str) -> None:
-        try:
-            db_path = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}"
-            dbutils.fs.ls(db_path)
-        except:
-            dbutils.fs.mkdirs(db_path)
+        db_path = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}"
+        if hasattr(dbutils, "fs"):
+            try:
+                dbutils.fs.ls(db_path)
+            except Exception:
+                dbutils.fs.mkdirs(db_path)
+        else:
+            logging.warning(f"DBUtils.fs not available; ensure directory {db_path} exists")
 
 
 # Data Sync
@@ -162,6 +225,8 @@ class PostgresAzureDataSync:
     def perform_operation(
         self, db: str, tables_to_copy: list
     ) -> None:
+        """Export specified tables from PostgreSQL to Delta storage."""
+
         if not self.postgres_handler.is_connection_alive():
             logging.error("PostgreSQL connection is not alive. Aborting operation.")
             return
@@ -172,8 +237,10 @@ class PostgresAzureDataSync:
                 # Ensure the directory exists
                 self.azure_handler.ensure_directory_exists("RAW", db)
                 # Export directly to Delta
+                start = time.time()
                 self.postgres_handler.export_table_to_delta(table, "RAW", db)
-                logging.info(f"Successfully processed table {table}")
+                duration = time.time() - start
+                logging.info(f"Successfully processed table {table} in {duration:.2f}s")
             except Exception as e:
                 logging.error(f"Failed to process table {table}: {str(e)}")
                 logging.error(traceback.format_exc())
@@ -196,6 +263,9 @@ pg_config = {
     ),
 }
 
+if not all(pg_config.values()):
+    raise ValueError("PostgreSQL configuration is incomplete")
+
 # Azure Configurations
 storage_config = {
     "account_name": "quilitydatabricks",
@@ -204,6 +274,9 @@ storage_config = {
     ),
     "container_name": "dataarchitecture",
 }
+
+if not storage_config.get("account_key"):
+    raise ValueError("Azure storage configuration is incomplete")
 
 # Table Configurations
 tables_to_copy = [
@@ -215,7 +288,7 @@ tables_to_copy = [
 # Execution
 try:
     pg_pool = PostgresDataHandler.connect_to_postgres(pg_config)
-    postgres_handler = PostgresDataHandler(pg_pool)
+    postgres_handler = PostgresDataHandler(pg_pool, pg_config)
     blob_service_client = AzureDataHandler.connect_to_azure_storage(storage_config)
     azure_handler = AzureDataHandler(blob_service_client)
     sync = PostgresAzureDataSync(postgres_handler, azure_handler)
@@ -224,4 +297,5 @@ try:
         tables_to_copy,
     )
 finally:
-    sync.postgres_handler.pg_pool.closeall()
+    if 'pg_pool' in locals():
+        pg_pool.closeall()
