@@ -4,10 +4,13 @@ import logging
 import pytz
 import dateutil.parser
 import traceback
+import json
+import os
+import time
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     col, current_timestamp, lit, udf, to_date, to_timestamp, when, lower,
-    coalesce, length, regexp_replace
+    coalesce, length, regexp_replace, year
 )
 from pyspark.sql.types import (
     BooleanType, DateType, DecimalType, DoubleType, StringType,
@@ -20,6 +23,29 @@ logger = logging.getLogger(__name__)
 
 # Create SparkSession
 spark: SparkSession = SparkSession.builder.getOrCreate()
+
+try:
+    from pyspark.dbutils import DBUtils
+    dbutils = DBUtils(spark)
+except Exception:  # pragma: no cover
+    class _DummySecrets:
+        def get(self, scope: str, key: str) -> str:
+            env_key = f"{scope}_{key}".upper()
+            value = os.getenv(env_key)
+            if value is None:
+                raise ValueError(f"Missing secret for {env_key}")
+            return value
+
+    class _DummyDBUtils:
+        secrets = _DummySecrets()
+
+    dbutils = _DummyDBUtils()
+    logger.warning("DBUtils not available; using environment variables for secrets")
+
+# Constants
+TIMEZONE = "America/New_York"
+RAW_BASE_PATH = "abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/RAW/LeadCustodyRepository"
+METADATA_BASE_PATH = "dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR_EDW/Metadata"
 
 # Define Snowflake connection configuration for the staging schema
 sf_config_stg: Dict[str, str] = {
@@ -401,7 +427,7 @@ def enhanced_parse_timestamp_udf(date_str):
 
     try:
         parsed_date = dateutil.parser.parse(str(date_str), fuzzy=False)
-        ny_timezone = pytz.timezone("America/New_York")
+        ny_timezone = pytz.timezone(TIMEZONE)
 
         if parsed_date.tzinfo is None:
             parsed_date = ny_timezone.localize(parsed_date)
@@ -413,13 +439,8 @@ def enhanced_parse_timestamp_udf(date_str):
             return current_datetime
 
         return parsed_date
-    except:
-        try:
-            # fallback to fuzzy parsing
-            parsed_date = dateutil.parser.parse(str(date_str), fuzzy=True)
-            return parsed_date
-        except:
-            return None
+    except Exception:
+        return None
 
 @udf(DateType())
 def enhanced_parse_date_udf(date_str):
@@ -435,14 +456,14 @@ def enhanced_parse_date_udf(date_str):
 
     try:
         parsed_date = dateutil.parser.parse(str(date_str), fuzzy=False).date()
-        current_date = datetime.now(pytz.timezone("America/New_York")).date()
+        current_date = datetime.now(pytz.timezone(TIMEZONE)).date()
         if parsed_date > current_date:
             return None
         return parsed_date
     except:
         return None
 
-def validate_dataframe(df: DataFrame, target_schema: StructType) -> None:
+def validate_dataframe(df: DataFrame, target_schema: StructType, check_types: bool = True) -> None:
     """
     Validates that the DataFrame has all columns with correct data types according to the target schema.
     """
@@ -457,7 +478,7 @@ def validate_dataframe(df: DataFrame, target_schema: StructType) -> None:
             error_msg = f"Column {col_name} is missing from the DataFrame"
             errors.append(error_msg)
             logger.error(error_msg)
-        elif not isinstance(df.schema[col_name].dataType, type(col_type)):
+        elif check_types and not isinstance(df.schema[col_name].dataType, type(col_type)):
             error_msg = (
                 f"Column {col_name} has type {df.schema[col_name].dataType}, "
                 f"but should be {col_type}"
@@ -478,16 +499,16 @@ def get_last_runtime(table_name: str) -> datetime:
     If not found, returns a past date to include all records.
     """
     try:
-        last_runtime_path = f"dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR_EDW/Metadata/last_runtime_{table_name}.txt"
+        last_runtime_path = f"{METADATA_BASE_PATH}/last_runtime_{table_name}.txt"
         last_runtime_str = spark.read.text(last_runtime_path).first()[0]
         last_runtime = datetime.strptime(
             last_runtime_str, "%Y-%m-%d %H:%M:%S.%f"
-        ).replace(tzinfo=pytz.timezone("America/New_York"))
+        ).replace(tzinfo=pytz.timezone(TIMEZONE))
         logger.info(f"Last runtime for table {table_name}: {last_runtime}")
         return last_runtime
     except Exception as e:
         logger.warning(f"Could not read last runtime for table {table_name}. Error: {str(e)}")
-        past_date = datetime(1900, 1, 1, tzinfo=pytz.timezone("America/New_York"))
+        past_date = datetime(1900, 1, 1, tzinfo=pytz.timezone(TIMEZONE))
         logger.info(f"Setting last_runtime to {past_date} for table {table_name}")
         return past_date
 
@@ -496,13 +517,31 @@ def update_last_runtime(table_name: str, new_runtime: datetime) -> None:
     Updates the last runtime for the given table in DBFS.
     """
     try:
-        last_runtime_path = f"dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR_EDW/Metadata/last_runtime_{table_name}.txt"
+        last_runtime_path = f"{METADATA_BASE_PATH}/last_runtime_{table_name}.txt"
         new_runtime_str = new_runtime.strftime("%Y-%m-%d %H:%M:%S.%f")
         spark.createDataFrame([(new_runtime_str,)], ["last_runtime"]).coalesce(1)\
             .write.mode("overwrite").text(last_runtime_path)
         logger.info(f"Updated last runtime for table {table_name} to {new_runtime}")
     except Exception as e:
         logger.error(f"Could not update last runtime for table {table_name}. Error: {str(e)}")
+
+def snowflake_table_exists(table_name: str) -> bool:
+    """Check if a table exists in Snowflake."""
+    query = (
+        f"SELECT 1 FROM information_schema.tables WHERE table_schema = '{sf_config_stg['sfSchema']}'"
+        f" AND table_name = '{table_name.upper()}'"
+    )
+    try:
+        df = spark.read.format("net.snowflake.spark.snowflake").options(**sf_config_stg).option("query", query).load()
+        return df.count() > 0
+    except Exception as e:
+        logger.error(f"Failed to check table existence: {e}")
+        return False
+
+def create_checkpoint(table_name: str) -> None:
+    """Create a checkpoint file after table processing."""
+    path = f"{METADATA_BASE_PATH}/checkpoint_{table_name}.txt"
+    spark.createDataFrame([(datetime.now().isoformat(),)], ["ts"]).coalesce(1).write.mode("overwrite").text(path)
 
 def clean_invalid_timestamps(df: DataFrame) -> DataFrame:
     """
@@ -519,11 +558,13 @@ def clean_invalid_timestamps(df: DataFrame) -> DataFrame:
         df = df.withColumn(
             ts_col,
             when(
-                (col(ts_col).isNull()) |
-                (col(ts_col).cast("string").rlike("^[A-Za-z]{1,3}$")) |
-                (length(col(ts_col).cast("string")) <= 3) |
-                (~col(ts_col).cast("string").rlike(".*\\d+.*")),
-                lit(None)
+                col(ts_col).isNull()
+                | col(ts_col).cast("string").rlike("^[A-Za-z]{1,3}$")
+                | (length(col(ts_col).cast("string")) <= 3)
+                | (~col(ts_col).cast("string").rlike(".*\\d+.*"))
+                | (year(col(ts_col)) < 1900)
+                | (year(col(ts_col)) > year(current_timestamp()) + 1),
+                lit(None),
             ).otherwise(col(ts_col))
         )
         
@@ -535,17 +576,29 @@ def clean_invalid_timestamps(df: DataFrame) -> DataFrame:
     
     return df
 
+@udf(StringType())
+def validate_json_udf(val: str) -> Optional[str]:
+    """Return the JSON string if valid, otherwise None."""
+    if val is None:
+        return None
+    try:
+        json.loads(val)
+        return val
+    except Exception:
+        return None
+
 def transform_column(df: DataFrame, col_name: str, col_type, table_name: str) -> DataFrame:
     """
     Transforms/cleans a single column to match the target data type, with special handling for JSON columns, etc.
     """
     # Handle JSON columns
     if table_name in json_columns and col_name in json_columns[table_name]:
-        logger.info(f"Applying JSON string handling for column {col_name} in table {table_name}")
+        logger.info(
+            f"Applying JSON validation for column {col_name} in table {table_name}"
+        )
         return df.withColumn(
             col_name,
-            when(col(col_name).isNull(), lit(None))
-            .otherwise(col(col_name).cast(StringType()))
+            validate_json_udf(col(col_name).cast(StringType()))
         )
     
     # Timestamp
@@ -628,7 +681,7 @@ def load_raw_data(table_name: str) -> DataFrame:
     """
     raw_table_name: str = table_name.replace("_", "")
     # This path is now corrected (removed the "public." prefix) to match the sync script
-    raw_dataset_path: str = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/RAW/LeadCustodyRepository/{raw_table_name}"
+    raw_dataset_path: str = f"{RAW_BASE_PATH}/{raw_table_name}"
 
     if table_name == "lead_assignment":
         logger.info(f"Loading {table_name} with special JSON handling")
@@ -717,6 +770,7 @@ def process_table(
         
         # 2) Rename columns and add missing ones
         raw_df = rename_and_add_columns(raw_df, table_name)
+        validate_dataframe(raw_df, table_schemas[table_name], check_types=False)
         after_rename_count = raw_df.count()
         if after_rename_count != source_count:
             logger.warning(f"Row count changed after column renaming: {source_count} -> {after_rename_count}")
@@ -724,6 +778,7 @@ def process_table(
         # 3) Transform columns
         target_schema = table_schemas[table_name]
         raw_df = transform_columns(raw_df, target_schema, table_name)
+        validate_dataframe(raw_df, target_schema)
         after_transform_count = raw_df.count()
         logger.info(f"Data transformation completed for table {table_name}")
         
@@ -777,11 +832,18 @@ def process_table(
                 ).otherwise(col(ts_col))
             )
 
+        final_count = raw_df.count()
+
         # 9) Write to Snowflake
+        if not snowflake_table_exists(f"STG_LCR_{table_name.upper()}"):
+            logger.error(f"Target table STG_LCR_{table_name.upper()} does not exist in Snowflake")
+            return
+
+        # Write records
         if write_mode == "append":
             if table_name == "lead_assignment" and historical_load:
                 truncate_options = {
-                    **snowflake_config,
+                    **sf_config_stg,
                     "dbtable": f"STG_LCR_{table_name.upper()}",
                     "truncate_table": "on"
                 }
@@ -791,15 +853,24 @@ def process_table(
                 logger.info(f"Table STG_LCR_{table_name.upper()} truncated successfully")
 
             write_options = {
-                **snowflake_config,
+                **sf_config_stg,
                 "dbtable": f"STG_LCR_{table_name.upper()}",
                 "on_error": "CONTINUE",
                 "column_mapping": "name"
             }
-            raw_df.write.format("net.snowflake.spark.snowflake").options(**write_options).mode("append").save()
+            for attempt in range(3):
+                try:
+                    raw_df.write.format("net.snowflake.spark.snowflake").options(**write_options).mode("append").save()
+                    break
+                except Exception as w_err:
+                    if attempt == 2:
+                        raise
+                    logger.warning(f"Snowflake write failed, retrying... {w_err}")
+                    time.sleep(5)
             logger.info(f"Successfully wrote {final_count} rows to Snowflake for table {table_name}")
+            create_checkpoint(table_name)
 
-        elif write_mode == "delta_insert":
+        elif write_mode == "incremental_insert":
             last_runtime = get_last_runtime(table_name)
             raw_df = raw_df.withColumn("MODIFY_DATE", coalesce(col("MODIFY_DATE"), col("CREATE_DATE")))
             raw_df_filtered = raw_df if historical_load else raw_df.filter(col("MODIFY_DATE") >= last_runtime)
@@ -811,15 +882,24 @@ def process_table(
             validate_dataframe(raw_df_filtered, target_schema)
             record_count = raw_df_filtered.count()
             write_options = {
-                **snowflake_config,
+                **sf_config_stg,
                 "dbtable": f"STG_LCR_{table_name.upper()}",
                 "column_mapping": "name",
                 "on_error": "CONTINUE",
                 "truncate": "true"
             }
-            raw_df_filtered.write.format("net.snowflake.spark.snowflake").options(**write_options).mode("append").save()
-            update_last_runtime(table_name, datetime.now(pytz.timezone("America/New_York")))
+            for attempt in range(3):
+                try:
+                    raw_df_filtered.write.format("net.snowflake.spark.snowflake").options(**write_options).mode("append").save()
+                    break
+                except Exception as w_err:
+                    if attempt == 2:
+                        raise
+                    logger.warning(f"Snowflake write failed, retrying... {w_err}")
+                    time.sleep(5)
+            update_last_runtime(table_name, datetime.now(pytz.timezone(TIMEZONE)))
             logger.info(f"Appended {record_count} new records to table STG_LCR_{table_name.upper()}")
+            create_checkpoint(table_name)
 
         else:
             raise ValueError(f"Invalid write mode: {write_mode}")
