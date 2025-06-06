@@ -665,10 +665,10 @@ def transform_column(df: DataFrame, col_name: str, col_type, table_name: str) ->
     elif isinstance(col_type, StringType) and col_name in boolean_string_columns:
         return df.withColumn(
             col_name,
-            when(lower(col(col_name)).isin("true", "1", "yes", "t"), lit("TRUE"))
-            .when(lower(col(col_name)).isin("false", "0", "no", "f"), lit("FALSE"))
+            when(lower(col(col_name).cast("string")).isin("true", "1", "yes", "t"), lit("TRUE"))
+            .when(lower(col(col_name).cast("string")).isin("false", "0", "no", "f"), lit("FALSE"))
             .when(col(col_name).isNull(), lit(None))
-            .otherwise(col(col_name)),
+            .otherwise(col(col_name).cast(StringType()))   # ← cast fixes the mismatch
         )
     
     # Fallback to String
@@ -904,8 +904,8 @@ def main():
     """
     Main entry point: iterate over tables, process each with chosen write_mode & historical_load options.
     """
-    write_mode = "append"
-    historical_load = True
+    write_mode = "incremental_insert"
+    historical_load = False
 
     for table in tables:
         should_process = table_processing_config.get(table, False)
