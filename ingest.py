@@ -691,7 +691,8 @@ def load_raw_data(table_name: str) -> DataFrame:
     Loads raw data for the given table from Delta storage.
     IMPORTANT: Ensure path matches the sync script's location so data is not duplicated.
     """
-    raw_table_name: str = table_name.replace("_", "")
+    # Keep underscores so writer & reader share the same folder
+    raw_table_name: str = table_name
     # This path is now corrected (removed the "public." prefix) to match the sync script
     raw_dataset_path: str = f"{RAW_BASE_PATH}/{raw_table_name}"
 
@@ -713,6 +714,19 @@ def load_raw_data(table_name: str) -> DataFrame:
             .option("inferSchema", "false")
             .load(raw_dataset_path)
         )
+
+def verify_row_count(df: DataFrame, table_name: str, postgres_handler) -> None:
+    """Validate that Delta row count matches the source Postgres count."""
+    expected = postgres_handler.get_table_count(f'public."{table_name}"')
+    actual = df.count()
+    if expected != actual:
+        logger.error(
+            f"Row count mismatch for {table_name}: Postgres {expected} vs Delta {actual}"
+        )
+        raise ValueError(
+            f"Row count mismatch for {table_name}: Postgres {expected} vs Delta {actual}"
+        )
+    logger.info(f"Row count validation passed for {table_name}: {actual} rows")
 
 def rename_and_add_columns(df: DataFrame, table_name: str) -> DataFrame:
     """
@@ -767,7 +781,8 @@ def add_metadata_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
 def process_table(
     table_name: str,
     write_mode: str,
-    historical_load: bool = False
+    historical_load: bool = False,
+    postgres_handler=None
 ) -> None:
     """
     Main workflow for a single table: load raw data, rename columns,
@@ -779,6 +794,8 @@ def process_table(
             truncate_table(table_name)
         # 1) Load raw data
         raw_df = load_raw_data(table_name)
+        if postgres_handler:
+            verify_row_count(raw_df, table_name, postgres_handler)
         logger.info(f"Loaded raw records from source for table {table_name} (row count skipped for performance).")
         
         # 2) Rename columns and add missing ones
@@ -911,10 +928,13 @@ def main():
     write_mode = "incremental_insert"
     historical_load = False
 
+    pg_pool = PostgresDataHandler.connect_to_postgres(pg_config)
+    postgres_handler = PostgresDataHandler(pg_pool, pg_config)
+
     for table in tables:
         should_process = table_processing_config.get(table, False)
         if should_process:
-            process_table(table, write_mode, historical_load)
+            process_table(table, write_mode, historical_load, postgres_handler)
         else:
             logger.info(f"Skipping processing for table: {table} as per configuration.")
 
