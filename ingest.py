@@ -544,6 +544,17 @@ def create_checkpoint(table_name: str) -> None:
     path = f"{METADATA_BASE_PATH}/checkpoint_{table_name}.txt"
     spark.createDataFrame([(datetime.now().isoformat(),)], ["ts"]).coalesce(1).write.mode("overwrite").text(path)
 
+def truncate_table(table_name: str) -> None:
+    """Truncate a staging table in Snowflake."""
+    opts = {
+        **sf_config_stg,
+        "dbtable": f"STG_LCR_{table_name.upper()}",
+        "truncate_table": "on",
+    }
+    spark.createDataFrame([], table_schemas[table_name]) \
+        .write.format("net.snowflake.spark.snowflake") \
+        .options(**opts).mode("overwrite").save()
+
 def clean_invalid_timestamps(df: DataFrame) -> DataFrame:
     """
     Removes obviously invalid timestamp values from timestamp columns,
@@ -764,6 +775,8 @@ def process_table(
     """
     logger.info(f"Starting processing for table: {table_name}")
     try:
+        if historical_load:
+            truncate_table(table_name)
         # 1) Load raw data
         raw_df = load_raw_data(table_name)
         logger.info(f"Loaded raw records from source for table {table_name} (row count skipped for performance).")
@@ -835,15 +848,6 @@ def process_table(
 
         # Write records
         if write_mode == "append":
-            if table_name == "lead_assignment" and historical_load:
-                truncate_options = {
-                    **sf_config_stg,
-                    "dbtable": f"STG_LCR_{table_name.upper()}",
-                    "truncate_table": "on"
-                }
-                dummy_df = spark.createDataFrame([], target_schema)
-                dummy_df.write.format("net.snowflake.spark.snowflake").options(**truncate_options).mode("overwrite").save()
-                logger.info(f"Table STG_LCR_{table_name.upper()} truncated successfully")
 
             write_options = {
                 **sf_config_stg,
