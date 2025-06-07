@@ -1,8 +1,7 @@
 from azure.storage.blob import BlobServiceClient
 from pyspark.sql import SparkSession
 from psycopg2 import pool, OperationalError, sql
-from typing import Dict, Optional
-import concurrent.futures
+from typing import Dict
 import logging
 import os
 import psycopg2
@@ -131,7 +130,6 @@ class PostgresDataHandler:
             }
 
             # Table name without quotes for JDBC
-            table_name = table.replace('"', '')
             schema, tbl = self._parse_table_name(table)
 
             # Use Spark's JDBC reader to load directly from PostgreSQL
