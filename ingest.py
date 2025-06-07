@@ -805,7 +805,7 @@ def process_table(
     """
     logger.info(f"Starting processing for table: {table_name}")
     try:
-        if historical_load:
+        if historical_load and write_mode != "append":
             truncate_table(table_name)
         # 1) Load raw data
         raw_df = load_raw_data(table_name)
@@ -915,8 +915,7 @@ def process_table(
                 **sf_config_stg,
                 "dbtable": f"STG_LCR_{table_name.upper()}",
                 "column_mapping": "name",
-                "on_error": "CONTINUE",
-                "truncate": "true"
+                "on_error": "CONTINUE"
             }
             for attempt in range(3):
                 try:
