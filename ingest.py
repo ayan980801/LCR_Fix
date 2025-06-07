@@ -937,32 +937,26 @@ def process_table(
 
         # Write records
         if write_mode == "append":
-            import uuid
-            temp_table = (
-                f"TMP_LCR_{table_name.upper()}_{int(time.time())}_"
-                f"{uuid.uuid4().hex.upper()}"
-            )
             write_options = {
                 **sf_config_stg,
-                "dbtable": temp_table,
+                "dbtable": f"STG_LCR_{table_name.upper()}",
                 "on_error": "CONTINUE",
-                "column_mapping": "name"
+                "column_mapping": "name",
             }
             for attempt in range(3):
                 try:
-                    raw_df.write.format("net.snowflake.spark.snowflake").options(**write_options).mode("overwrite").save()
+                    raw_df.write.format("net.snowflake.spark.snowflake") \
+                        .options(**write_options).mode("append").save()
                     break
                 except Exception as w_err:
                     if attempt == 2:
                         raise
-                    logger.warning(f"Snowflake write failed, retrying... {w_err}")
+                    logger.warning("Snowflake append failed, retrying… %s", w_err)
                     time.sleep(5)
-            # Atomically replace target and clean up temp
-            swap_temp_into_target(temp_table, f"STG_LCR_{table_name.upper()}")
-            # Prevent full reload on next incremental run
+
             update_last_runtime(table_name, datetime.now(pytz.timezone(TIMEZONE)))
-            logger.info(f"Successfully refreshed STG_LCR_{table_name.upper()} via temp swap (row count skipped for performance).")
             create_checkpoint(table_name)
+            logger.info("Appended records to STG_LCR_%s", table_name.upper())
 
         elif write_mode == "incremental_insert":
             last_runtime = get_last_runtime(table_name)
