@@ -7,7 +7,7 @@ import traceback
 import json
 import os
 import time
-from sync import PostgresDataHandler, pg_config
+
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     col, current_timestamp, lit, udf, to_date, to_timestamp, when, lower,
@@ -43,8 +43,67 @@ except Exception:  # pragma: no cover
     class _DummyDBUtils:
         secrets = _DummySecrets()
 
+
     dbutils = _DummyDBUtils()
     logger.warning("DBUtils not available; using environment variables for secrets")
+
+# --------------------------------------------------------------------
+# Stand-alone pg helper – ingest must not depend on sync.py
+# --------------------------------------------------------------------
+try:
+    import psycopg2
+    import psycopg2.pool  # Databricks clusters often ship psycopg2-binary
+except ImportError as _pg_err:  # pragma: no cover
+    psycopg2 = None  # Let the RuntimeError below explain what to do
+
+# ---- pg_config (copied from sync.py so this file is self-contained) --
+pg_config: Dict[str, str] = {
+    "host":     dbutils.secrets.get("key-vault-secret", "DataProduct-PG-Host"),
+    "port":     dbutils.secrets.get("key-vault-secret", "DataProduct-PG-Port"),
+    "database": dbutils.secrets.get("key-vault-secret", "DataProduct-PG-DB"),
+    "user":     dbutils.secrets.get("key-vault-secret", "DataProduct-PG-User"),
+    "password": dbutils.secrets.get("key-vault-secret", "DataProduct-PG-Pass"),
+}
+
+class PostgresDataHandler:
+    """Lightweight wrapper used by ingest — only the methods ingest.py calls."""
+
+    def __init__(self, pool, config):
+        self.pool = pool
+        self.config = config
+
+    # ----------------------------------------------------------------
+    # Static: build a connection-pool (identical signature to sync.py)
+    # ----------------------------------------------------------------
+    @staticmethod
+    def connect_to_postgres(config):
+        if psycopg2 is None:
+            raise RuntimeError(
+                "psycopg2 wheel not found; install psycopg2-binary or attach the library "
+                "to this Databricks cluster before running ingest.py."
+            )
+        return psycopg2.pool.SimpleConnectionPool(
+            minconn=1,
+            maxconn=int(os.getenv("PG_MAX_CONN", "4")),
+            host=config["host"],
+            port=config["port"],
+            database=config["database"],
+            user=config["user"],
+            password=config["password"],
+        )
+
+    # ----------------------------------------------------------------
+    # Query helpers – ingest only needs get_table_count right now
+    # ----------------------------------------------------------------
+    def get_table_count(self, table_name: str) -> int:
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+                return cur.fetchone()[0]
+        finally:
+            self.pool.putconn(conn)
+# --------------------------------------------------------------------
  
 # Constants
 TIMEZONE = "America/New_York"
@@ -464,7 +523,7 @@ def enhanced_parse_date_udf(date_str):
         if parsed_date > current_date:
             return None
         return parsed_date
-    except:
+    except Exception:
         return None
 
 def validate_dataframe(df: DataFrame, target_schema: StructType, check_types: bool = True) -> None:
