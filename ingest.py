@@ -58,11 +58,11 @@ except ImportError as _pg_err:  # pragma: no cover
 
 # ---- pg_config (copied from sync.py so this file is self-contained) --
 pg_config: Dict[str, str] = {
-    "host":     dbutils.secrets.get("key-vault-secret", "DataProduct-PG-Host"),
-    "port":     dbutils.secrets.get("key-vault-secret", "DataProduct-PG-Port"),
-    "database": dbutils.secrets.get("key-vault-secret", "DataProduct-PG-DB"),
-    "user":     dbutils.secrets.get("key-vault-secret", "DataProduct-PG-User"),
-    "password": dbutils.secrets.get("key-vault-secret", "DataProduct-PG-Pass"),
+    "host":     dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-Host-PROD"),
+    "port":     dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-Port-PROD"),
+    "database": "LeadCustodyRepository",
+    "user":     dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-User-PROD"),
+    "password": dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-Pass-PROD"),
 }
 
 class PostgresDataHandler:
@@ -612,7 +612,7 @@ def truncate_table(table_name: str) -> None:
     opts = {
         **sf_config_stg,
         "dbtable": f"STG_LCR_{table_name.upper()}",
-        "truncate_table": "on",
+        "TRUNCATE_TABLE": "ON",
     }
     spark.createDataFrame([], table_schemas[table_name]) \
         .write.format("net.snowflake.spark.snowflake") \
@@ -1013,9 +1013,7 @@ def main():
     Main entry point: iterate over tables, process each with chosen write_mode & historical_load options.
     """
     write_mode = "append"
-    historical_load = (
-        os.getenv("LCR_HISTORICAL_LOAD", "false").lower() == "true"
-    )
+    historical_load = "true"
 
     pg_pool = None
     try:
