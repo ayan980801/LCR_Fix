@@ -557,17 +557,18 @@ def truncate_table(table_name: str) -> None:
         .options(**opts).mode("overwrite").save()
 
 def swap_temp_into_target(temp_table: str, target_table: str) -> None:
-    """Create-or-replace target from temp and drop temp so no leftovers remain."""
-    # Replace target with temp
-    spark.read.format("net.snowflake.spark.snowflake")\
-        .options(**sf_config_stg)\
-        .option("query", f"CREATE OR REPLACE TABLE {target_table} AS SELECT * FROM {temp_table}")\
-        .load()
-    # Drop temp table to prevent storage bloat
-    spark.read.format("net.snowflake.spark.snowflake")\
-        .options(**sf_config_stg)\
-        .option("query", f"DROP TABLE IF EXISTS {temp_table}")\
-        .load()
+    """Atomically replace target with temp and *always* drop the temp table."""
+    try:
+        # swap in one atomic statement
+        spark.read.format("net.snowflake.spark.snowflake")\
+            .options(**sf_config_stg)\
+            .option("query", f"CREATE OR REPLACE TABLE {target_table} AS SELECT * FROM {temp_table}")\
+            .load()
+    finally:  # ensure cleanup even if the swap raises
+        spark.read.format("net.snowflake.spark.snowflake")\
+            .options(**sf_config_stg)\
+            .option("query", f"DROP TABLE IF EXISTS {temp_table}")\
+            .load()
 
 def clean_invalid_timestamps(df: DataFrame) -> DataFrame:
     """
@@ -944,8 +945,8 @@ def main():
     """
     Main entry point: iterate over tables, process each with chosen write_mode & historical_load options.
     """
-    write_mode = "incremental_insert"
-    historical_load = False
+    write_mode = "append"
+    historical_load = True  # set back to False after the first full rebuild
 
     pg_pool = None
     try:
