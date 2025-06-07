@@ -7,7 +7,6 @@ import traceback
 import json
 import os
 import time
-
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     col, current_timestamp, lit, udf, to_date, to_timestamp, when, lower,
@@ -24,9 +23,6 @@ logger = logging.getLogger(__name__)
 
 # Create SparkSession
 spark: SparkSession = SparkSession.builder.getOrCreate()
-# set Spark log level for concise output
-auto_level = os.getenv("SPARK_LOG", "WARN").upper()
-spark.sparkContext.setLogLevel(auto_level)
 
 try:
     from pyspark.dbutils import DBUtils
@@ -43,83 +39,13 @@ except Exception:  # pragma: no cover
     class _DummyDBUtils:
         secrets = _DummySecrets()
 
-
     dbutils = _DummyDBUtils()
     logger.warning("DBUtils not available; using environment variables for secrets")
-
-# --------------------------------------------------------------------
-# Stand-alone pg helper – ingest must not depend on sync.py
-# --------------------------------------------------------------------
-try:
-    import psycopg2
-    import psycopg2.pool  # Databricks clusters often ship psycopg2-binary
-except ImportError as _pg_err:  # pragma: no cover
-    psycopg2 = None  # Let the RuntimeError below explain what to do
-
-# ---- pg_config (copied from sync.py so this file is self-contained) --
-pg_config: Dict[str, str] = {
-    "host":     dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-Host-PROD"),
-    "port":     dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-Port-PROD"),
-    "database": "LeadCustodyRepository",
-    "user":     dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-User-PROD"),
-    "password": dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-Pass-PROD"),
-}
-
-class PostgresDataHandler:
-    """Lightweight wrapper used by ingest — only the methods ingest.py calls."""
-
-    def __init__(self, pool, config):
-        self.pool = pool
-        self.config = config
-
-    # ----------------------------------------------------------------
-    # Static: build a connection-pool (identical signature to sync.py)
-    # ----------------------------------------------------------------
-    @staticmethod
-    def connect_to_postgres(config):
-        if psycopg2 is None:
-            raise RuntimeError(
-                "psycopg2 wheel not found; install psycopg2-binary or attach the library "
-                "to this Databricks cluster before running ingest.py."
-            )
-        return psycopg2.pool.SimpleConnectionPool(
-            minconn=1,
-            maxconn=int(os.getenv("PG_MAX_CONN", "4")),
-            host=config["host"],
-            port=config["port"],
-            database=config["database"],
-            user=config["user"],
-            password=config["password"],
-        )
-
-    # ----------------------------------------------------------------
-    # Query helpers – ingest only needs get_table_count right now
-    # ----------------------------------------------------------------
-    def get_table_count(self, table_name: str) -> int:
-        conn = self.pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(f"SELECT COUNT(*) FROM {table_name}")
-                return cur.fetchone()[0]
-        finally:
-            self.pool.putconn(conn)
-# --------------------------------------------------------------------
  
 # Constants
 TIMEZONE = "America/New_York"
-RAW_BASE_PATH = (
-    "abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/"
-    "RAW/LeadCustodyRepository"
-)
-METADATA_BASE_PATH = (
-    "dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR_EDW/Metadata"
-)
-
-# Map "lead_assignment" ➜ "leadassignment", etc.  This keeps all the
-# existing variable-names in the ingest script intact while converting
-# them to the naming convention used by sync.py when it writes paths.
-def _clean_name(name: str) -> str:
-    return name.replace("_", "")
+RAW_BASE_PATH = "abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/RAW/LeadCustodyRepository"
+METADATA_BASE_PATH = "dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR_EDW/Metadata"
 
 # Define Snowflake connection configuration for the staging schema
 sf_config_stg: Dict[str, str] = {
@@ -534,7 +460,7 @@ def enhanced_parse_date_udf(date_str):
         if parsed_date > current_date:
             return None
         return parsed_date
-    except Exception:
+    except:
         return None
 
 def validate_dataframe(df: DataFrame, target_schema: StructType, check_types: bool = True) -> None:
@@ -617,30 +543,6 @@ def create_checkpoint(table_name: str) -> None:
     """Create a checkpoint file after table processing."""
     path = f"{METADATA_BASE_PATH}/checkpoint_{table_name}.txt"
     spark.createDataFrame([(datetime.now().isoformat(),)], ["ts"]).coalesce(1).write.mode("overwrite").text(path)
-
-def truncate_table(table_name: str) -> None:
-    """Truncate a staging table in Snowflake."""
-    opts = {
-        **sf_config_stg,
-        "dbtable": f"STG_LCR_{table_name.upper()}",
-        "TRUNCATE_TABLE": "ON",
-    }
-    spark.createDataFrame([], table_schemas[table_name]) \
-        .write.format("net.snowflake.spark.snowflake") \
-        .options(**opts).mode("overwrite").save()
-
-def swap_temp_into_target(temp_table: str, target_table: str) -> None:
-    """Atomically replace target with temp and *always* drop the temp table."""
-    # atomic metadata-preserving swap
-    spark.read.format("net.snowflake.spark.snowflake")\
-        .options(**sf_config_stg)\
-        .option("query", f"ALTER TABLE {target_table} SWAP WITH {temp_table}")\
-        .load()
-    # always drop the (now empty) temp
-    spark.read.format("net.snowflake.spark.snowflake")\
-        .options(**sf_config_stg)\
-        .option("query", f"DROP TABLE IF EXISTS {temp_table}")\
-        .load()
 
 def clean_invalid_timestamps(df: DataFrame) -> DataFrame:
     """
@@ -778,8 +680,8 @@ def load_raw_data(table_name: str) -> DataFrame:
     Loads raw data for the given table from Delta storage.
     IMPORTANT: Ensure path matches the sync script's location so data is not duplicated.
     """
-    # Use the same folder name that sync.py wrote
-    raw_table_name: str = _clean_name(table_name)
+    raw_table_name: str = table_name.replace("_", "")
+    # This path is now corrected (removed the "public." prefix) to match the sync script
     raw_dataset_path: str = f"{RAW_BASE_PATH}/{raw_table_name}"
 
     if table_name == "lead_assignment":
@@ -800,7 +702,6 @@ def load_raw_data(table_name: str) -> DataFrame:
             .option("inferSchema", "false")
             .load(raw_dataset_path)
         )
-
 
 def rename_and_add_columns(df: DataFrame, table_name: str) -> DataFrame:
     """
@@ -855,8 +756,7 @@ def add_metadata_columns(df: DataFrame, target_schema: StructType) -> DataFrame:
 def process_table(
     table_name: str,
     write_mode: str,
-    historical_load: bool = False,
-    postgres_handler=None
+    historical_load: bool = False
 ) -> None:
     """
     Main workflow for a single table: load raw data, rename columns,
@@ -864,11 +764,9 @@ def process_table(
     """
     logger.info(f"Starting processing for table: {table_name}")
     try:
-        if historical_load and write_mode != "append":
-            truncate_table(table_name)
         # 1) Load raw data
         raw_df = load_raw_data(table_name)
-        logger.info("Loaded raw records from source for table %s (row-count check skipped).", table_name)
+        logger.info(f"Loaded raw records from source for table {table_name} (row count skipped for performance).")
         
         # 2) Rename columns and add missing ones
         raw_df = rename_and_add_columns(raw_df, table_name)
@@ -937,49 +835,47 @@ def process_table(
 
         # Write records
         if write_mode == "append":
-            import uuid
-            temp_table = (
-                f"TMP_LCR_{table_name.upper()}_{int(time.time())}_"
-                f"{uuid.uuid4().hex.upper()}"
-            )
+            if table_name == "lead_assignment" and historical_load:
+                truncate_options = {
+                    **sf_config_stg,
+                    "dbtable": f"STG_LCR_{table_name.upper()}",
+                    "truncate_table": "on"
+                }
+                dummy_df = spark.createDataFrame([], target_schema)
+                dummy_df.write.format("net.snowflake.spark.snowflake").options(**truncate_options).mode("overwrite").save()
+                logger.info(f"Table STG_LCR_{table_name.upper()} truncated successfully")
+
             write_options = {
                 **sf_config_stg,
-                "dbtable": temp_table,
+                "dbtable": f"STG_LCR_{table_name.upper()}",
                 "on_error": "CONTINUE",
                 "column_mapping": "name"
             }
             for attempt in range(3):
                 try:
-                    raw_df.write.format("net.snowflake.spark.snowflake").options(**write_options).mode("overwrite").save()
+                    raw_df.write.format("net.snowflake.spark.snowflake").options(**write_options).mode("append").save()
                     break
                 except Exception as w_err:
                     if attempt == 2:
                         raise
                     logger.warning(f"Snowflake write failed, retrying... {w_err}")
                     time.sleep(5)
-            # Atomically replace target and clean up temp
-            swap_temp_into_target(temp_table, f"STG_LCR_{table_name.upper()}")
-            # Prevent full reload on next incremental run
-            update_last_runtime(table_name, datetime.now(pytz.timezone(TIMEZONE)))
-            logger.info(f"Successfully refreshed STG_LCR_{table_name.upper()} via temp swap (row count skipped for performance).")
+            logger.info(f"Successfully wrote to Snowflake for table {table_name} (row count skipped for performance).")
             create_checkpoint(table_name)
 
         elif write_mode == "incremental_insert":
             last_runtime = get_last_runtime(table_name)
             raw_df = raw_df.withColumn("MODIFY_DATE", coalesce(col("MODIFY_DATE"), col("CREATE_DATE")))
             # NOTE: We no longer check if DataFrame is empty due to performance. Snowflake will ignore empty writes.
-            raw_df_filtered = (
-                raw_df
-                if historical_load
-                else raw_df.filter(col("MODIFY_DATE") > last_runtime)
-            )
+            raw_df_filtered = raw_df if historical_load else raw_df.filter(col("MODIFY_DATE") >= last_runtime)
 
             validate_dataframe(raw_df_filtered, target_schema)
             write_options = {
                 **sf_config_stg,
                 "dbtable": f"STG_LCR_{table_name.upper()}",
                 "column_mapping": "name",
-                "on_error": "CONTINUE"
+                "on_error": "CONTINUE",
+                "truncate": "true"
             }
             for attempt in range(3):
                 try:
@@ -1008,32 +904,17 @@ def main():
     """
     Main entry point: iterate over tables, process each with chosen write_mode & historical_load options.
     """
-    write_mode = "append"
-    historical_load = "true"
+    write_mode = "incremental_insert"
+    historical_load = False
 
-    pg_pool = None
-    try:
-        pg_pool = PostgresDataHandler.connect_to_postgres(pg_config)
-    except Exception as e:
-        logger.error(f"Failed to connect to PostgreSQL: {e}")
-        return
+    for table in tables:
+        should_process = table_processing_config.get(table, False)
+        if should_process:
+            process_table(table, write_mode, historical_load)
+        else:
+            logger.info(f"Skipping processing for table: {table} as per configuration.")
 
-    postgres_handler = PostgresDataHandler(pg_pool, pg_config)
-
-    try:
-        for table in tables:
-            should_process = table_processing_config.get(table, False)
-            if should_process:
-                process_table(table, write_mode, historical_load, postgres_handler)
-            else:
-                logger.info(
-                    f"Skipping processing for table: {table} as per configuration."
-                )
-
-        logger.info("ETL process completed successfully.")
-    finally:
-        if pg_pool:
-            pg_pool.closeall()
+    logger.info("ETL process completed successfully.")
 
 if __name__ == "__main__":
     main()
