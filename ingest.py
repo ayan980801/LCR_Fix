@@ -460,7 +460,7 @@ def enhanced_parse_date_udf(date_str):
         if parsed_date > current_date:
             return None
         return parsed_date
-    except:
+    except Exception:
         return None
 
 def validate_dataframe(df: DataFrame, target_schema: StructType, check_types: bool = True) -> None:
@@ -761,6 +761,9 @@ def process_table(
     """
     Main workflow for a single table: load raw data, rename columns,
     transform data, handle special logic, validate, and write to Snowflake.
+
+    When ``write_mode`` is ``"append"`` and ``historical_load`` is ``True``, the
+    corresponding staging table is truncated before new data is inserted.
     """
     logger.info(f"Starting processing for table: {table_name}")
     try:
@@ -835,15 +838,20 @@ def process_table(
 
         # Write records
         if write_mode == "append":
-            if table_name == "lead_assignment" and historical_load:
+            if historical_load:
                 truncate_options = {
                     **sf_config_stg,
                     "dbtable": f"STG_LCR_{table_name.upper()}",
                     "truncate_table": "on"
                 }
-                dummy_df = spark.createDataFrame([], target_schema)
-                dummy_df.write.format("net.snowflake.spark.snowflake").options(**truncate_options).mode("overwrite").save()
-                logger.info(f"Table STG_LCR_{table_name.upper()} truncated successfully")
+                spark.createDataFrame([], target_schema) \
+                    .write.format("net.snowflake.spark.snowflake") \
+                    .options(**truncate_options) \
+                    .mode("overwrite") \
+                    .save()
+                logger.info(
+                    f"Table STG_LCR_{table_name.upper()} truncated (historical append)"
+                )
 
             write_options = {
                 **sf_config_stg,
