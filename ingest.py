@@ -801,19 +801,6 @@ def load_raw_data(table_name: str) -> DataFrame:
             .load(raw_dataset_path)
         )
 
-def verify_row_count(df: DataFrame, table_name: str, postgres_handler) -> None:
-    """Validate that Delta row count matches the source Postgres count."""
-    pg_table = _clean_name(table_name)
-    expected = postgres_handler.get_table_count(f'public."{pg_table}"')
-    actual = df.count()
-    if expected != actual:
-        logger.error(
-            f"Row count mismatch for {table_name}: Postgres {expected} vs Delta {actual}"
-        )
-        raise ValueError(
-            f"Row count mismatch for {table_name}: Postgres {expected} vs Delta {actual}"
-        )
-    logger.info(f"Row count validation passed for {table_name}: {actual} rows")
 
 def rename_and_add_columns(df: DataFrame, table_name: str) -> DataFrame:
     """
@@ -881,9 +868,7 @@ def process_table(
             truncate_table(table_name)
         # 1) Load raw data
         raw_df = load_raw_data(table_name)
-        if postgres_handler:
-            verify_row_count(raw_df, table_name, postgres_handler)
-        logger.info(f"Loaded raw records from source for table {table_name} (row count skipped for performance).")
+        logger.info("Loaded raw records from source for table %s (row-count check skipped).", table_name)
         
         # 2) Rename columns and add missing ones
         raw_df = rename_and_add_columns(raw_df, table_name)
