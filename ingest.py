@@ -107,8 +107,19 @@ class PostgresDataHandler:
  
 # Constants
 TIMEZONE = "America/New_York"
-RAW_BASE_PATH = "abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/RAW/LeadCustodyRepository"
-METADATA_BASE_PATH = "dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR_EDW/Metadata"
+RAW_BASE_PATH = (
+    "abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/"
+    "RAW/LeadCustodyRepository"
+)
+METADATA_BASE_PATH = (
+    "dbfs:/FileStore/DataProduct/DataArchitecture/Pipelines/LCR_EDW/Metadata"
+)
+
+# Map "lead_assignment" ➜ "leadassignment", etc.  This keeps all the
+# existing variable-names in the ingest script intact while converting
+# them to the naming convention used by sync.py when it writes paths.
+def _clean_name(name: str) -> str:
+    return name.replace("_", "")
 
 # Define Snowflake connection configuration for the staging schema
 sf_config_stg: Dict[str, str] = {
@@ -767,9 +778,8 @@ def load_raw_data(table_name: str) -> DataFrame:
     Loads raw data for the given table from Delta storage.
     IMPORTANT: Ensure path matches the sync script's location so data is not duplicated.
     """
-    # Keep underscores so writer & reader share the same folder
-    raw_table_name: str = table_name
-    # This path is now corrected (removed the "public." prefix) to match the sync script
+    # Use the same folder name that sync.py wrote
+    raw_table_name: str = _clean_name(table_name)
     raw_dataset_path: str = f"{RAW_BASE_PATH}/{raw_table_name}"
 
     if table_name == "lead_assignment":
@@ -793,7 +803,8 @@ def load_raw_data(table_name: str) -> DataFrame:
 
 def verify_row_count(df: DataFrame, table_name: str, postgres_handler) -> None:
     """Validate that Delta row count matches the source Postgres count."""
-    expected = postgres_handler.get_table_count(f'public."{table_name}"')
+    pg_table = _clean_name(table_name)
+    expected = postgres_handler.get_table_count(f'public."{pg_table}"')
     actual = df.count()
     if expected != actual:
         logger.error(
