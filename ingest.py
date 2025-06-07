@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 # Create SparkSession
 spark: SparkSession = SparkSession.builder.getOrCreate()
+# set Spark log level for concise output
+auto_level = os.getenv("SPARK_LOG", "WARN").upper()
+spark.sparkContext.setLogLevel(auto_level)
 
 try:
     from pyspark.dbutils import DBUtils
@@ -558,17 +561,16 @@ def truncate_table(table_name: str) -> None:
 
 def swap_temp_into_target(temp_table: str, target_table: str) -> None:
     """Atomically replace target with temp and *always* drop the temp table."""
-    try:
-        # swap in one atomic statement
-        spark.read.format("net.snowflake.spark.snowflake")\
-            .options(**sf_config_stg)\
-            .option("query", f"CREATE OR REPLACE TABLE {target_table} AS SELECT * FROM {temp_table}")\
-            .load()
-    finally:  # ensure cleanup even if the swap raises
-        spark.read.format("net.snowflake.spark.snowflake")\
-            .options(**sf_config_stg)\
-            .option("query", f"DROP TABLE IF EXISTS {temp_table}")\
-            .load()
+    # atomic metadata-preserving swap
+    spark.read.format("net.snowflake.spark.snowflake")\
+        .options(**sf_config_stg)\
+        .option("query", f"ALTER TABLE {target_table} SWAP WITH {temp_table}")\
+        .load()
+    # always drop the (now empty) temp
+    spark.read.format("net.snowflake.spark.snowflake")\
+        .options(**sf_config_stg)\
+        .option("query", f"DROP TABLE IF EXISTS {temp_table}")\
+        .load()
 
 def clean_invalid_timestamps(df: DataFrame) -> DataFrame:
     """
@@ -881,7 +883,10 @@ def process_table(
         # Write records
         if write_mode == "append":
             import uuid
-            temp_table = f"TMP_LCR_{table_name.upper()}_" + uuid.uuid4().hex.upper()
+            temp_table = (
+                f"TMP_LCR_{table_name.upper()}_{int(time.time())}_"
+                f"{uuid.uuid4().hex.upper()}"
+            )
             write_options = {
                 **sf_config_stg,
                 "dbtable": temp_table,
@@ -908,7 +913,11 @@ def process_table(
             last_runtime = get_last_runtime(table_name)
             raw_df = raw_df.withColumn("MODIFY_DATE", coalesce(col("MODIFY_DATE"), col("CREATE_DATE")))
             # NOTE: We no longer check if DataFrame is empty due to performance. Snowflake will ignore empty writes.
-            raw_df_filtered = raw_df if historical_load else raw_df.filter(col("MODIFY_DATE") >= last_runtime)
+            raw_df_filtered = (
+                raw_df
+                if historical_load
+                else raw_df.filter(col("MODIFY_DATE") > last_runtime)
+            )
 
             validate_dataframe(raw_df_filtered, target_schema)
             write_options = {
@@ -945,7 +954,9 @@ def main():
     Main entry point: iterate over tables, process each with chosen write_mode & historical_load options.
     """
     write_mode = "append"
-    historical_load = True  # set back to False after the first full rebuild
+    historical_load = (
+        os.getenv("LCR_HISTORICAL_LOAD", "false").lower() == "true"
+    )
 
     pg_pool = None
     try:
