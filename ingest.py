@@ -556,6 +556,19 @@ def truncate_table(table_name: str) -> None:
         .write.format("net.snowflake.spark.snowflake") \
         .options(**opts).mode("overwrite").save()
 
+def swap_temp_into_target(temp_table: str, target_table: str) -> None:
+    """Create-or-replace target from temp and drop temp so no leftovers remain."""
+    # Replace target with temp
+    spark.read.format("net.snowflake.spark.snowflake")\
+        .options(**sf_config_stg)\
+        .option("query", f"CREATE OR REPLACE TABLE {target_table} AS SELECT * FROM {temp_table}")\
+        .load()
+    # Drop temp table to prevent storage bloat
+    spark.read.format("net.snowflake.spark.snowflake")\
+        .options(**sf_config_stg)\
+        .option("query", f"DROP TABLE IF EXISTS {temp_table}")\
+        .load()
+
 def clean_invalid_timestamps(df: DataFrame) -> DataFrame:
     """
     Removes obviously invalid timestamp values from timestamp columns,
@@ -866,23 +879,28 @@ def process_table(
 
         # Write records
         if write_mode == "append":
-
+            import uuid
+            temp_table = f"TMP_LCR_{table_name.upper()}_" + uuid.uuid4().hex.upper()
             write_options = {
                 **sf_config_stg,
-                "dbtable": f"STG_LCR_{table_name.upper()}",
+                "dbtable": temp_table,
                 "on_error": "CONTINUE",
                 "column_mapping": "name"
             }
             for attempt in range(3):
                 try:
-                    raw_df.write.format("net.snowflake.spark.snowflake").options(**write_options).mode("append").save()
+                    raw_df.write.format("net.snowflake.spark.snowflake").options(**write_options).mode("overwrite").save()
                     break
                 except Exception as w_err:
                     if attempt == 2:
                         raise
                     logger.warning(f"Snowflake write failed, retrying... {w_err}")
                     time.sleep(5)
-            logger.info(f"Successfully wrote to Snowflake for table {table_name} (row count skipped for performance).")
+            # Atomically replace target and clean up temp
+            swap_temp_into_target(temp_table, f"STG_LCR_{table_name.upper()}")
+            # Prevent full reload on next incremental run
+            update_last_runtime(table_name, datetime.now(pytz.timezone(TIMEZONE)))
+            logger.info(f"Successfully refreshed STG_LCR_{table_name.upper()} via temp swap (row count skipped for performance).")
             create_checkpoint(table_name)
 
         elif write_mode == "incremental_insert":
