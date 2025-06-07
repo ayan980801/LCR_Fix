@@ -7,6 +7,7 @@ import traceback
 import json
 import os
 import time
+from sync import PostgresDataHandler, pg_config
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     col, current_timestamp, lit, udf, to_date, to_timestamp, when, lower,
@@ -928,17 +929,29 @@ def main():
     write_mode = "incremental_insert"
     historical_load = False
 
-    pg_pool = PostgresDataHandler.connect_to_postgres(pg_config)
+    pg_pool = None
+    try:
+        pg_pool = PostgresDataHandler.connect_to_postgres(pg_config)
+    except Exception as e:
+        logger.error(f"Failed to connect to PostgreSQL: {e}")
+        return
+
     postgres_handler = PostgresDataHandler(pg_pool, pg_config)
 
-    for table in tables:
-        should_process = table_processing_config.get(table, False)
-        if should_process:
-            process_table(table, write_mode, historical_load, postgres_handler)
-        else:
-            logger.info(f"Skipping processing for table: {table} as per configuration.")
+    try:
+        for table in tables:
+            should_process = table_processing_config.get(table, False)
+            if should_process:
+                process_table(table, write_mode, historical_load, postgres_handler)
+            else:
+                logger.info(
+                    f"Skipping processing for table: {table} as per configuration."
+                )
 
-    logger.info("ETL process completed successfully.")
+        logger.info("ETL process completed successfully.")
+    finally:
+        if pg_pool:
+            pg_pool.closeall()
 
 if __name__ == "__main__":
     main()
