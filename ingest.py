@@ -10,7 +10,7 @@ import time
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     col, current_timestamp, lit, udf, to_date, to_timestamp, when, lower,
-    coalesce, length, regexp_replace, year
+    coalesce, length, regexp_replace, year, max as spark_max
 )
 from pyspark.sql.types import (
     BooleanType, DateType, DecimalType, DoubleType, StringType,
@@ -493,37 +493,25 @@ def validate_dataframe(df: DataFrame, target_schema: StructType, check_types: bo
         
     logger.info("DataFrame validation completed successfully")
 
-def get_last_runtime(table_name: str) -> datetime:
-    """
-    Retrieves the last runtime for the given table from DBFS.
-    If not found, returns a past date to include all records.
-    """
+def get_etl_last_update_date(table_name: str) -> Optional[str]:
+    """Read the watermark for a table as a string timestamp."""
+    path = f"{METADATA_BASE_PATH}/etl_last_update_{table_name}.txt"
     try:
-        last_runtime_path = f"{METADATA_BASE_PATH}/last_runtime_{table_name}.txt"
-        last_runtime_str = spark.read.text(last_runtime_path).first()[0]
-        last_runtime = datetime.strptime(
-            last_runtime_str, "%Y-%m-%d %H:%M:%S.%f"
-        ).replace(tzinfo=pytz.timezone(TIMEZONE))
-        logger.info(f"Last runtime for table {table_name}: {last_runtime}")
-        return last_runtime
-    except Exception as e:
-        logger.warning(f"Could not read last runtime for table {table_name}. Error: {str(e)}")
-        past_date = datetime(1900, 1, 1, tzinfo=pytz.timezone(TIMEZONE))
-        logger.info(f"Setting last_runtime to {past_date} for table {table_name}")
-        return past_date
+        df = spark.read.text(path)
+        return df.first()[0].strip()
+    except Exception as ex:  # pragma: no cover - watermark may not exist
+        logger.info(f"No watermark found for {table_name}: {ex}")
+        return None
 
-def update_last_runtime(table_name: str, new_runtime: datetime) -> None:
-    """
-    Updates the last runtime for the given table in DBFS.
-    """
+
+def update_etl_last_update_date(table_name: str, new_value: str) -> None:
+    """Write the watermark for a table as a string timestamp."""
+    path = f"{METADATA_BASE_PATH}/etl_last_update_{table_name}.txt"
     try:
-        last_runtime_path = f"{METADATA_BASE_PATH}/last_runtime_{table_name}.txt"
-        new_runtime_str = new_runtime.strftime("%Y-%m-%d %H:%M:%S.%f")
-        spark.createDataFrame([(new_runtime_str,)], ["last_runtime"]).coalesce(1)\
-            .write.mode("overwrite").text(last_runtime_path)
-        logger.info(f"Updated last runtime for table {table_name} to {new_runtime}")
-    except Exception as e:
-        logger.error(f"Could not update last runtime for table {table_name}. Error: {str(e)}")
+        spark.createDataFrame([(new_value,)], ["watermark"]).coalesce(1).write.mode("overwrite").text(path)
+        logger.info(f"Watermark for {table_name} updated to {new_value}")
+    except Exception as ex:
+        logger.error(f"Could not update watermark for {table_name}: {ex}")
 
 def snowflake_table_exists(table_name: str) -> bool:
     """Check if a table exists in Snowflake."""
@@ -872,10 +860,14 @@ def process_table(
             create_checkpoint(table_name)
 
         elif write_mode == "incremental_insert":
-            last_runtime = get_last_runtime(table_name)
-            raw_df = raw_df.withColumn("MODIFY_DATE", coalesce(col("MODIFY_DATE"), col("CREATE_DATE")))
+            watermark = get_etl_last_update_date(table_name)
             # NOTE: We no longer check if DataFrame is empty due to performance. Snowflake will ignore empty writes.
-            raw_df_filtered = raw_df if historical_load else raw_df.filter(col("MODIFY_DATE") >= last_runtime)
+            if watermark and not historical_load:
+                raw_df_filtered = raw_df.filter(
+                    col("ETL_LAST_UPDATE_DATE") > to_timestamp(lit(watermark))
+                )
+            else:
+                raw_df_filtered = raw_df
 
             validate_dataframe(raw_df_filtered, target_schema)
             write_options = {
@@ -894,7 +886,12 @@ def process_table(
                         raise
                     logger.warning(f"Snowflake write failed, retrying... {w_err}")
                     time.sleep(5)
-            update_last_runtime(table_name, datetime.now(pytz.timezone(TIMEZONE)))
+
+            if "ETL_LAST_UPDATE_DATE" in raw_df_filtered.columns:
+                max_val = raw_df_filtered.agg(spark_max(col("ETL_LAST_UPDATE_DATE"))).collect()[0][0]
+                if max_val:
+                    update_etl_last_update_date(table_name, str(max_val))
+
             logger.info(f"Appended records to table STG_LCR_{table_name.upper()} (row count skipped for performance).")
             create_checkpoint(table_name)
 
