@@ -157,7 +157,7 @@ table_schemas: Dict[str, StructType] = {
             StructField("MAILING_ID", StringType(), True),
             StructField("SUSPECT_CAMPAIGN_ID", DecimalType(38, 0), True),
             StructField("CONSUMER_DEBT", DoubleType(), True),
-            StructField("MORTGAGE_DEBT", DoubleType(), True),
+            StructField("MORTGAGE_DEBT", StringType(), True),
             StructField("UTM_CAMPAIGN", StringType(), True),
             StructField("UTM_MEDIUM", StringType(), True),
             StructField("UTM_SOURCE", StringType(), True),
@@ -578,7 +578,8 @@ def validate_json_udf(val: str) -> Optional[str]:
 
 def transform_column(df: DataFrame, col_name: str, col_type, table_name: str) -> DataFrame:
     """
-    Transforms/cleans a single column to match the target data type, with special handling for JSON columns, etc.
+    Transforms/cleans a single column to match the target data type,
+    with special handling for JSON columns, etc.
     """
     # Handle JSON columns
     if table_name in json_columns and col_name in json_columns[table_name]:
@@ -589,7 +590,7 @@ def transform_column(df: DataFrame, col_name: str, col_type, table_name: str) ->
             col_name,
             validate_json_udf(col(col_name).cast(StringType()))
         )
-    
+
     # Timestamp
     if isinstance(col_type, TimestampType):
         df = df.withColumn(
@@ -610,7 +611,7 @@ def transform_column(df: DataFrame, col_name: str, col_type, table_name: str) ->
                 )
             ),
         )
-    
+
     # Date
     elif isinstance(col_type, DateType):
         return df.withColumn(
@@ -622,16 +623,16 @@ def transform_column(df: DataFrame, col_name: str, col_type, table_name: str) ->
                 )
             ),
         )
-    
+
     # Decimal
     elif isinstance(col_type, DecimalType):
         precision, scale = col_type.precision, col_type.scale
         return df.withColumn(col_name, col(col_name).cast(DecimalType(precision, scale)))
-    
+
     # Double
     elif isinstance(col_type, DoubleType):
         return df.withColumn(col_name, col(col_name).cast(DoubleType()))
-    
+
     # Boolean
     elif isinstance(col_type, BooleanType):
         return df.withColumn(
@@ -648,20 +649,21 @@ def transform_column(df: DataFrame, col_name: str, col_type, table_name: str) ->
                 ).otherwise(lit(None))
             ),
         )
-    
-    # Boolean strings
+
+    # Boolean strings (preserve "TRUE"/"FALSE" as string)
     elif isinstance(col_type, StringType) and col_name in boolean_string_columns:
         return df.withColumn(
             col_name,
             when(lower(col(col_name).cast("string")).isin("true", "1", "yes", "t"), lit("TRUE"))
             .when(lower(col(col_name).cast("string")).isin("false", "0", "no", "f"), lit("FALSE"))
             .when(col(col_name).isNull(), lit(None))
-            .otherwise(col(col_name).cast(StringType()))   # ← cast fixes the mismatch
+            .otherwise(col(col_name).cast(StringType()))
         )
-    
-    # Fallback to String
+
+    # Fallback to String for all other columns (including MORTGAGE_DEBT)
     else:
         return df.withColumn(col_name, col(col_name).cast(StringType()))
+    
 
 def load_raw_data(table_name: str) -> DataFrame:
     """
@@ -859,6 +861,13 @@ def process_table(
             logger.info(f"Successfully wrote to Snowflake for table {table_name} (row count skipped for performance).")
             create_checkpoint(table_name)
 
+            # --------> Write watermark on historical run <--------
+            if historical_load and "ETL_LAST_UPDATE_DATE" in raw_df.columns:
+                max_val = raw_df.agg(spark_max(col("ETL_LAST_UPDATE_DATE"))).collect()[0][0]
+                if max_val:
+                    update_etl_last_update_date(table_name, str(max_val))
+            # -----------------------------------------------------
+
         elif write_mode == "incremental_insert":
             watermark = get_etl_last_update_date(table_name)
             # NOTE: We no longer check if DataFrame is empty due to performance. Snowflake will ignore empty writes.
@@ -905,12 +914,13 @@ def process_table(
         logger.error(traceback.format_exc())
         raise
 
+
 def main():
     """
     Main entry point: iterate over tables, process each with chosen write_mode & historical_load options.
     """
-    write_mode = "incremental_insert"
-    historical_load = False
+    write_mode = "append"
+    historical_load = True
 
     for table in tables:
         should_process = table_processing_config.get(table, False)
