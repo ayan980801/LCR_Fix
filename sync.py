@@ -1,22 +1,19 @@
-import os
-import re
-import time
-import logging
-import traceback
-from typing import Dict, List, Optional, Tuple
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import current_timestamp, lit
 from azure.storage.blob import BlobServiceClient
+from pyspark.sql import SparkSession
+from psycopg2 import pool, OperationalError, sql
+from typing import Dict
+import logging
+import os
 import psycopg2
-from psycopg2 import pool, sql, OperationalError
+import re
+import traceback
+import time
+from pyspark.sql.functions import current_timestamp, lit
 
-# DBUtils fallback
 try:
     from pyspark.dbutils import DBUtils
-
     dbutils = DBUtils(SparkSession.builder.getOrCreate())
-except Exception:
-
+except Exception:  # pragma: no cover - running outside Databricks
     class _DummySecrets:
         def get(self, scope: str, key: str) -> str:
             env_key = f"{scope}_{key}".upper()
@@ -27,9 +24,7 @@ except Exception:
 
     class _DummyFS:
         def ls(self, path: str):
-            raise NotImplementedError(
-                "dbutils.fs.ls not implemented outside Databricks"
-            )
+            raise NotImplementedError("dbutils.fs.ls not implemented outside Databricks")
 
         def mkdirs(self, path: str):
             logging.info(f"[DRY-RUN] Would create directory: {path}")
@@ -39,31 +34,35 @@ except Exception:
         fs = _DummyFS()
 
     dbutils = _DummyDBUtils()
-    logging.warning("DBUtils not available; using environment variables for secrets.")
+    logging.warning("DBUtils not available; using environment variables for secrets")
 
-# Logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Spark Session
+# Create SparkSession
 spark = SparkSession.builder.getOrCreate()
 
-# OOP HANDLERS
+
+# Postgres Handler
 class PostgresDataHandler:
+    """Handle PostgreSQL interactions using a connection pool."""
+
     def __init__(self, pg_pool: pool.ThreadedConnectionPool, pg_config: Dict[str, str]):
         self.pg_pool = pg_pool
         self.pg_config = pg_config
 
     @staticmethod
     def connect_to_postgres(pg_config: Dict[str, str]) -> pool.ThreadedConnectionPool:
+        """Create a connection pool to PostgreSQL."""
         try:
             return psycopg2.pool.ThreadedConnectionPool(1, 20, **pg_config)
         except OperationalError as e:
             logging.error(f"Failed to connect to PostgreSQL: {str(e)}")
             raise
 
-    def is_connection_alive(self) -> bool:
+    def is_connection_alive(self):
+        """Check if a connection from the pool is alive."""
         conn = self.pg_pool.getconn()
         try:
             with conn.cursor() as cursor:
@@ -76,149 +75,72 @@ class PostgresDataHandler:
 
     @staticmethod
     def _is_valid_table_name(table: str) -> bool:
+        """Validate table name to contain only allowed characters."""
         return bool(re.fullmatch(r"[\w\.\"]+", table))
 
     @staticmethod
-    def _parse_table_name(table: str) -> Tuple[str, str]:
-        clean = table.replace('"', "")
-        if "." in clean:
-            schema, tbl = clean.split(".", 1)
+    def _parse_table_name(table: str) -> (str, str):
+        """Split schema.table into components and remove quotes."""
+        clean = table.replace('"', '')
+        if '.' in clean:
+            schema, tbl = clean.split('.', 1)
         else:
-            schema, tbl = "public", clean
+            schema, tbl = 'public', clean
         return schema, tbl
 
-    def _get_numeric_pk_column(self, table: str) -> Optional[str]:
-        """Automatically detect a suitable partition column (integer PK preferred)"""
-        schema, tbl = self._parse_table_name(table)
-        conn = self.pg_pool.getconn()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT a.attname
-                    FROM pg_index i
-                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-                    WHERE i.indrelid = %s::regclass AND i.indisprimary
-                """,
-                    (f"{schema}.{tbl}",),
-                )
-                pk_cols = [row[0] for row in cursor.fetchall()]
-                if pk_cols:
-                    # Check if PK is integer-like
-                    cursor.execute(
-                        """
-                        SELECT attname, format_type(atttypid, atttypmod)
-                        FROM pg_attribute
-                        WHERE attrelid = %s::regclass
-                        AND attname = ANY(%s)
-                    """,
-                        (f"{schema}.{tbl}", pk_cols),
-                    )
-                    for attname, atttype in cursor.fetchall():
-                        if "int" in atttype or "serial" in atttype:
-                            return attname
-                # Fallback | Integer
-                cursor.execute(
-                    """
-                    SELECT column_name, data_type
-                    FROM information_schema.columns
-                    WHERE table_schema = %s AND table_name = %s
-                """,
-                    (schema, tbl),
-                )
-                for cname, ctype in cursor.fetchall():
-                    if ctype in ("integer", "bigint", "smallint"):
-                        return cname
-        except Exception as e:
-            logging.warning(f"Could not determine numeric PK column for {table}: {e}")
-        finally:
-            self.pg_pool.putconn(conn)
-        return None
-
-    def _get_partition_bounds(
-        self, table: str, partition_column: str
-    ) -> Optional[Tuple[int, int]]:
-        schema, tbl = self._parse_table_name(table)
-        conn = self.pg_pool.getconn()
-        try:
-            with conn.cursor() as cursor:
-                query = sql.SQL("SELECT MIN({0}), MAX({0}) FROM {1}.{2}").format(
-                    sql.Identifier(partition_column),
-                    sql.Identifier(schema),
-                    sql.Identifier(tbl),
-                )
-                cursor.execute(query)
-                bounds = cursor.fetchone()
-                if bounds and None not in bounds:
-                    return bounds
-        except Exception as e:
-            logging.warning(
-                f"Could not get partition bounds for {table}.{partition_column}: {e}"
-            )
-        finally:
-            self.pg_pool.putconn(conn)
-        return None
-
-    def _jdbc_read(
-        self, table: str, fetchsize: int = 20000, num_partitions: int = 8
-    ) -> DataFrame:
-        schema, tbl = self._parse_table_name(table)
-        jdbc_url = f"jdbc:postgresql://{self.pg_config['host']}:{self.pg_config['port']}/{self.pg_config['database']}"
-        options = {
-            "url": jdbc_url,
-            "dbtable": f"{schema}.{tbl}",
-            "user": self.pg_config["user"],
-            "password": self.pg_config["password"],
-            "driver": "org.postgresql.Driver",
-            "fetchsize": str(fetchsize),
-            "pushDownPredicate": "true",
-        }
-        partition_column = self._get_numeric_pk_column(table)
-        if partition_column:
-            bounds = self._get_partition_bounds(table, partition_column)
-            if bounds:
-                lower, upper = bounds
-                options.update(
-                    {
-                        "partitionColumn": partition_column,
-                        "lowerBound": str(lower),
-                        "upperBound": str(upper),
-                        "numPartitions": str(num_partitions),
-                    }
-                )
-                logging.info(
-                    f"Reading in parallel: {tbl} partition_column={partition_column}, bounds=({lower}, {upper}), numPartitions={num_partitions}"
-                )
-            else:
-                logging.warning(
-                    f"No bounds for partition column {partition_column}, reading single partition for {tbl}"
-                )
-        else:
-            logging.warning(
-                f"No suitable partition column found for {tbl}, reading single partition."
-            )
-        df = spark.read.format("jdbc").options(**options).load()
-        return df
-
-    def export_table_to_delta(
-        self,
-        table: str,
-        stage: str,
-        db: str,
-        fetchsize: int = 20000,
-        num_partitions: int = 8,
-    ):
+    def get_table_count(self, table: str) -> int:
+        """Get actual row count from a PostgreSQL table in a safe manner."""
         if not self._is_valid_table_name(table):
             raise ValueError(f"Invalid table name: {table}")
+
         schema, tbl = self._parse_table_name(table)
+        conn = self.pg_pool.getconn()
         try:
-            logging.info(f"--- Starting JDBC export for {table} ---")
-            start = time.time()
-            df = self._jdbc_read(
-                table, fetchsize=fetchsize, num_partitions=num_partitions
-            )
-            row_count = df.count()
-            logging.info(f"Rows read from {table}: {row_count}")
+            with conn.cursor() as cursor:
+                query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                    sql.Identifier(schema), sql.Identifier(tbl)
+                )
+                cursor.execute(query)
+                count = cursor.fetchone()[0]
+                logging.info(f"PostgreSQL count for {table}: {count}")
+                return count
+        finally:
+            self.pg_pool.putconn(conn)
+
+    def export_table_to_delta(self, table: str, stage: str, db: str, fetchsize: int = 10000) -> None:
+        """
+        Export a table directly from PostgreSQL to Delta Lake using JDBC.
+        This bypasses CSV completely and avoids all the row count issues.
+        Row counts are NOT computed due to performance considerations.
+        """
+        try:
+            if not self._is_valid_table_name(table):
+                raise ValueError(f"Invalid table name: {table}")
+
+            logging.info(f"Starting direct JDBC export for {table}")
+
+            # Create JDBC URL and properties
+            jdbc_url = f"jdbc:postgresql://{self.pg_config['host']}:{self.pg_config['port']}/{self.pg_config['database']}"
+            properties = {
+                "user": self.pg_config['user'],
+                "password": self.pg_config['password'],
+                "driver": "org.postgresql.Driver",
+                # Increase fetch size for better performance
+                "fetchsize": str(fetchsize),
+            }
+
+            # Table name without quotes for JDBC
+            schema, tbl = self._parse_table_name(table)
+
+            # Use Spark's JDBC reader to load directly from PostgreSQL
+            df = spark.read.jdbc(url=jdbc_url, table=f"{schema}.{tbl}", properties=properties)
+
+            # Log the schema to verify correct data types
+            logging.info(f"JDBC schema for {table}:")
+            for field in df.schema.fields:
+                logging.info(f"  {field.name}: {field.dataType}")
+
+            # Add metadata columns
             df = df.withColumns(
                 {
                     "ETL_CREATED_DATE": current_timestamp(),
@@ -228,41 +150,40 @@ class PostgresDataHandler:
                     "EDW_EXTERNAL_SOURCE_SYSTEM": lit("LeadCustodyRepository"),
                 }
             )
-            delta_path = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}/{tbl}"
+
+            # Calculate Delta Lake path
+            clean_table = tbl
+            flp = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}/{clean_table}"
+
+            # Write to Delta Lake
             df.write.format("delta").mode("overwrite").option(
                 "overwriteSchema", "true"
-            ).save(delta_path)
-            duration = time.time() - start
-            logging.info(
-                f"Exported {table} to Delta (rows: {row_count}) in {duration:.2f}s"
-            )
-            logging.info("Spark 4 EXPLAIN (extended):")
-            df.explain("extended")
+            ).save(flp)
+
+            # Instead, log export completion
+            logging.info(f"Successfully exported table {table} to Delta (row counts skipped for performance).")
+
         except Exception as e:
-            logging.error(f"Failed to export table '{table}': {e}")
+            logging.error(f"Failed to export table '{table}': {str(e)}")
             logging.error(traceback.format_exc())
             raise
 
 
+# Azure Data Handler
 class AzureDataHandler:
-    def __init__(self, blob_service_client: BlobServiceClient):
+    def __init__(self, blob_service_client):
         self.blob_service_client = blob_service_client
 
     @staticmethod
-    def connect_to_azure_storage(storage_config: Dict[str, str]) -> BlobServiceClient:
+    def connect_to_azure_storage(storage_config: dict) -> BlobServiceClient:
         try:
-            connection_string = (
-                f"DefaultEndpointsProtocol=https;"
-                f"AccountName={storage_config['account_name']};"
-                f"AccountKey={storage_config['account_key']};"
-                "EndpointSuffix=core.windows.net"
-            )
+            connection_string = f"DefaultEndpointsProtocol=https;AccountName={storage_config['account_name']};AccountKey={storage_config['account_key']};EndpointSuffix=core.windows.net"
             return BlobServiceClient.from_connection_string(connection_string)
         except Exception as e:
-            logging.error(f"Failed to connect to Azure Storage: {e}")
+            logging.error(f"Failed to connect to Azure Storage: {str(e)}")
             raise
 
-    def ensure_directory_exists(self, stage: str, db: str):
+    def ensure_directory_exists(self, stage: str, db: str) -> None:
         db_path = f"abfss://dataarchitecture@quilitydatabricks.dfs.core.windows.net/{stage}/{db}"
         if hasattr(dbutils, "fs"):
             try:
@@ -270,11 +191,10 @@ class AzureDataHandler:
             except Exception:
                 dbutils.fs.mkdirs(db_path)
         else:
-            logging.warning(
-                f"DBUtils.fs not available; ensure directory {db_path} exists."
-            )
+            logging.warning(f"DBUtils.fs not available; ensure directory {db_path} exists")
 
 
+# Data Sync
 class PostgresAzureDataSync:
     def __init__(
         self, postgres_handler: PostgresDataHandler, azure_handler: AzureDataHandler
@@ -282,55 +202,80 @@ class PostgresAzureDataSync:
         self.postgres_handler = postgres_handler
         self.azure_handler = azure_handler
 
-    def perform_operation(self, db: str, tables_to_copy: List[str]):
+    def perform_operation(
+        self, db: str, tables_to_copy: list
+    ) -> None:
+        """Export specified tables from PostgreSQL to Delta storage."""
+
         if not self.postgres_handler.is_connection_alive():
             logging.error("PostgreSQL connection is not alive. Aborting operation.")
             return
+
         for table in tables_to_copy:
             try:
                 logging.info(f"Processing table {table}")
+                # Ensure the directory exists
                 self.azure_handler.ensure_directory_exists("RAW", db)
+                # Export directly to Delta
+                start = time.time()
                 self.postgres_handler.export_table_to_delta(table, "RAW", db)
-                logging.info(f"Successfully processed table {table}")
+                duration = time.time() - start
+                logging.info(f"Successfully processed table {table} in {duration:.2f}s")
             except Exception as e:
-                logging.error(f"Failed to process table {table}: {e}")
+                logging.error(f"Failed to process table {table}: {str(e)}")
                 logging.error(traceback.format_exc())
 
 
-# CONFIGURATION
-
+# PostgreSQL Configurations
 pg_config = {
-    "host": dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-Host-PROD"),
-    "port": dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-Port-PROD"),
+    "host": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-LCR-Host-PROD"
+    ),
+    "port": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-LCR-Port-PROD"
+    ),
     "database": "LeadCustodyRepository",
-    "user": dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-User-PROD"),
-    "password": dbutils.secrets.get("key-vault-secret", "DataProduct-LCR-Pass-PROD"),
+    "user": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-LCR-User-PROD"
+    ),
+    "password": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-LCR-Pass-PROD"
+    ),
 }
 
 if not all(pg_config.values()):
-    raise ValueError("PostgreSQL configuration is incomplete.")
+    raise ValueError("PostgreSQL configuration is incomplete")
+
+# Azure Configurations
 storage_config = {
     "account_name": "quilitydatabricks",
-    "account_key": dbutils.secrets.get("key-vault-secret", "DataProduct-ADLS-Key"),
+    "account_key": dbutils.secrets.get(
+        scope="key-vault-secret", key="DataProduct-ADLS-Key"
+    ),
     "container_name": "dataarchitecture",
 }
 
 if not storage_config.get("account_key"):
-    raise ValueError("Azure storage configuration is incomplete.")
+    raise ValueError("Azure storage configuration is incomplete")
+
+# Table Configurations
 tables_to_copy = [
     'public."leadassignment"',
     'public."leadxref"',
     'public."lead"',
 ]
 
-# EXECUTION
+# Execution
 try:
     pg_pool = PostgresDataHandler.connect_to_postgres(pg_config)
     postgres_handler = PostgresDataHandler(pg_pool, pg_config)
     blob_service_client = AzureDataHandler.connect_to_azure_storage(storage_config)
     azure_handler = AzureDataHandler(blob_service_client)
     sync = PostgresAzureDataSync(postgres_handler, azure_handler)
-    sync.perform_operation(pg_config["database"], tables_to_copy)
+    sync.perform_operation(
+        pg_config["database"],
+        tables_to_copy,
+    )
 finally:
-    if "pg_pool" in locals():
+    if 'pg_pool' in locals():
         pg_pool.closeall()
