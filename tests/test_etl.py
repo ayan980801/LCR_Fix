@@ -1,11 +1,11 @@
 import os
 import sys
+import hashlib
 import pytest
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import sha2, concat_ws, col
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from ingest import add_etl_change_tracking
+from ingest import add_hash_key
 
 
 @pytest.fixture(scope="session")
@@ -15,7 +15,7 @@ def spark():
     spark.stop()
 
 
-def test_add_etl_change_tracking(spark):
+def test_add_hash_key(spark):
     df = spark.createDataFrame([(1, "a")], ["id", "val"])
     metadata_cols = [
         "ETL_CREATED_DATE",
@@ -23,13 +23,11 @@ def test_add_etl_change_tracking(spark):
         "CREATED_BY",
         "TO_PROCESS",
         "EDW_EXTERNAL_SOURCE_SYSTEM",
-        "ETL_CHANGE_TRACKING",
     ]
-    result = add_etl_change_tracking(df, metadata_cols)
-    expected = df.select(
-        sha2(concat_ws("||", col("id").cast("string"), col("val")), 512).alias("hash")
-    ).first()[0]
-    assert result.select("ETL_CHANGE_TRACKING").first()[0] == expected
+    result = add_hash_key(df, metadata_cols + ["HASH_COL"], "HASH_COL")
+    expected_str = f"{df.first().id}||{df.first().val}"
+    expected = hashlib.sha3_512(expected_str.encode("utf-8")).hexdigest()
+    assert result.select("HASH_COL").first()[0] == expected
 
 
 def test_anti_join_logic(spark):
@@ -40,13 +38,12 @@ def test_anti_join_logic(spark):
         "CREATED_BY",
         "TO_PROCESS",
         "EDW_EXTERNAL_SOURCE_SYSTEM",
-        "ETL_CHANGE_TRACKING",
     ]
-    df_hashed = add_etl_change_tracking(df, metadata_cols)
+    df_hashed = add_hash_key(df, metadata_cols + ["HASH_COL"], "HASH_COL")
     target = df_hashed.limit(1)
     filtered = df_hashed.join(
-        target.select("ETL_CHANGE_TRACKING"),
-        on="ETL_CHANGE_TRACKING",
+        target.select("HASH_COL"),
+        on="HASH_COL",
         how="left_anti",
     )
     remaining = [row.id for row in filtered.collect()]
