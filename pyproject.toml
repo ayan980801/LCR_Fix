@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lcr-fix"
+version = "0.1.0"
+description = "Python & PySpark ETL project for Databricks"
+authors = [{name = "LCR Team"}]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyspark==4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "C", "N", "D", "UP", "S", "B", "A", "C4", "ICN", "PIE", "T20", "RET", "SIM", "ARG", "ERA", "PD", "PGH", "PL", "TRY", "NPY", "PERF", "FURB", "LOG", "RUF"]
+ignore = [
+    "D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107",  # Missing docstrings
+    "S101",  # Use of assert
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

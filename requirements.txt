@@ -1,0 +1,3 @@
+pytest
+pyspark==4.0.0
+ruff
