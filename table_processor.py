@@ -63,7 +63,7 @@ class TableProcessor:
             )
             return len(df.take(1)) > 0
         except Exception as e:
-            logging.error(f"Failed to check table existence: {e}")
+            logging.exception(f"Failed to check table existence: {e}")
             return False
 
     def create_checkpoint(self) -> None:
@@ -209,6 +209,6 @@ class TableProcessor:
                 raise ValueError(f"Invalid write mode: {self.write_mode}")
             logging.info(f"Completed processing for table: {self.table_name}")
         except Exception as e:
-            logging.error(f"Unexpected error processing table {self.table_name}: {str(e)}")
-            logging.error(traceback.format_exc())
+            logging.exception(f"Unexpected error processing table {self.table_name}: {e!s}")
+            logging.exception(traceback.format_exc())
             raise

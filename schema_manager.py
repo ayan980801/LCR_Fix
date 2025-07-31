@@ -1,10 +1,9 @@
-from typing import Dict
 from pyspark.sql.types import (BooleanType, DateType, DecimalType, DoubleType, StringType, StructField, StructType, TimestampType)
 # -----------------------------------------------------------------------------
 class SchemaManager:
     """Stores all schema definitions and column mappings."""
 
-    TABLE_SCHEMAS: Dict[str, StructType] = {
+    TABLE_SCHEMAS: dict[str, StructType] = {
         # ... (the full schema definitions for lead, lead_xref, lead_assignment) ...
         "lead": StructType([
             StructField("STG_LCR_LEAD_KEY", StringType(), True),
@@ -174,7 +173,7 @@ class SchemaManager:
         ]),
     }
 
-    COLUMN_MAPPINGS: Dict[str, Dict[str, str]] = {
+    COLUMN_MAPPINGS: dict[str, dict[str, str]] = {
         # ... All mapping dicts, verbatim, for each table ...
         "lead": {
             "leadguid": "LEAD_GUID",

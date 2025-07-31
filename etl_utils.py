@@ -1,7 +1,6 @@
 import json
 import hashlib
 from datetime import datetime
-from typing import List, Optional
 
 import pytz
 import dateutil.parser
@@ -77,7 +76,7 @@ def enhanced_parse_date_udf(date_str):
 
 
 @udf(StringType())
-def validate_json_udf(val: str) -> Optional[str]:
+def validate_json_udf(val: str) -> str | None:
     if val is None:
         return None
     try:
@@ -88,7 +87,7 @@ def validate_json_udf(val: str) -> Optional[str]:
 
 
 @udf(StringType())
-def sha3_512_udf(val: str) -> Optional[str]:
+def sha3_512_udf(val: str) -> str | None:
     if val is None:
         return None
     return hashlib.sha3_512(val.encode("utf-8")).hexdigest()
@@ -228,7 +227,7 @@ def rename_and_add_columns(df: DataFrame, table_name: str) -> DataFrame:
     return df
 
 
-def add_hash_key(df: DataFrame, metadata_cols: List[str], key_col: str) -> DataFrame:
+def add_hash_key(df: DataFrame, metadata_cols: list[str], key_col: str) -> DataFrame:
     non_meta_cols = [c for c in df.columns if c not in metadata_cols and c != key_col]
     concatenated = concat_ws("||", *[col(c).cast("string") for c in non_meta_cols])
     return df.withColumn(key_col, sha3_512_udf(concatenated))

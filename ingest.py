@@ -4,7 +4,7 @@ from table_processor import TableProcessor
 from etl_utils import add_hash_key
 import logging
 
-__all__ = ["add_hash_key", "ETLPipeline"]
+__all__ = ["ETLPipeline", "add_hash_key"]
 
 
 class ETLPipeline:
